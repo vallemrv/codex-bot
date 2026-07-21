@@ -243,10 +243,11 @@ def _context_bar(file_size: int, model: str | None = None) -> str:
     return f"{icon} ctx ~{pct}%{win_tag} ({size_str}){tip}"
 
 
-def _ctx_pct(tokens_input: int, model: str | None = None) -> tuple[str, int]:
+def _ctx_pct(tokens_input: int, model: str | None = None,
+             window: int | None = None) -> tuple[str, int]:
     """Returns (inline indicator, pct) from real input token count.
     Window depends on the model (1M for opus-1m, else 200K)."""
-    window = cc.context_window(model)
+    window = window or cc.context_window(model)
     pct = min(99, tokens_input * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
     win_tag = " /1M" if window >= 1_000_000 else ""
@@ -496,7 +497,7 @@ def _build_status_text(st: dict) -> str:
         lines.append(f"✍️ _{snip}_")
     tok_in = st.get("tokens_input", 0)
     if tok_in:
-        ctx_str, _ = _ctx_pct(tok_in, st.get("model"))
+        ctx_str, _ = _ctx_pct(tok_in, st.get("model"), st.get("context_window"))
         lines.append(ctx_str)
     lines.append("\n_Pulsa_ /esc _para cancelar_")
     return "\n".join(lines)
@@ -654,6 +655,7 @@ def _start_status(skey: str, directory: str, msg_id: int, model: str,
         "state": "pending", "tool": None, "tools_seen": [], "files_edited": {},
         "reasoning_text": None, "stream_text": "", "start_time": time.time(),
         "last_update_time": time.time(), "tokens_input": 0, "tokens_output": 0,
+        "context_window": None,
         "cost": 0.0, "dirty": False,
     }
     _ensure_flusher()
@@ -691,7 +693,7 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
     effort_str = f" · ⚡`{effort or 'high'}`"
     header = f"{icon} `{cwd_name}` | 🧩 `{model}`{effort_str} | ⏱ `{elapsed}`"
     if tok_in:
-        ctx_str, ctx_pct = _ctx_pct(tok_in, model)
+        ctx_str, ctx_pct = _ctx_pct(tok_in, model, st.get("context_window"))
         header += f" | {ctx_str}"
     else:
         ctx_pct = 0
@@ -943,6 +945,7 @@ async def _run_task(skey: str, directory: str, prompt: str,
                 if st:
                     st["tokens_input"] = ev["input"]
                     st["tokens_output"] = ev["output"]
+                    st["context_window"] = ev.get("context_window")
             elif t == "result":
                 final = ev
                 if st:

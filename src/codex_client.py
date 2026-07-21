@@ -28,6 +28,7 @@ EFFORT_LEVELS = {
     "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
 }
 MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
+SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
 
 def cli_model(model: str | None) -> str | None:
@@ -88,6 +89,39 @@ def set_question_bridge(fn) -> None:
 
 
 def build_mcp_server():
+    return None
+
+
+def _last_context_usage(session_id: str | None) -> tuple[int, int] | None:
+    """Read the actual context used by the latest turn from Codex's journal.
+
+    The ``usage`` field in a resumed ``turn.completed`` can be cumulative.  The
+    journal's ``last_token_usage`` is the context of that individual turn.
+    """
+    if not session_id:
+        return None
+    try:
+        for path in SESSIONS_DIR.rglob("*.jsonl"):
+            with path.open(encoding="utf-8") as journal:
+                if session_id not in journal.readline():
+                    continue
+                latest: tuple[int, int] | None = None
+                for line in journal:
+                    try:
+                        event = json.loads(line)
+                        payload = event.get("payload") or {}
+                        if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                            continue
+                        info = payload.get("info") or {}
+                        tokens = int((info.get("last_token_usage") or {}).get("input_tokens") or 0)
+                        window = int(info.get("model_context_window") or 0)
+                        if tokens and window:
+                            latest = (tokens, window)
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        continue
+                return latest
+    except OSError as exc:
+        logger.debug("No se pudo leer el contexto de la sesión %s: %s", session_id, exc)
     return None
 
 
@@ -180,6 +214,7 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
     stderr_task = asyncio.create_task(proc.stderr.read())
 
     final_text = ""
+    live_session_id = resume_session_id
     tokens_in = tokens_out = 0
     error_message = ""
     while True:
@@ -194,6 +229,7 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
         if etype == "thread.started":
             sid = event.get("thread_id")
             if sid:
+                live_session_id = sid
                 yield {"type": "session", "session_id": sid}
         elif etype in {"item.started", "item.completed", "item.updated"}:
             item = event.get("item") or {}
@@ -205,7 +241,13 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
             usage = event.get("usage") or {}
             tokens_in = usage.get("input_tokens", 0) or 0
             tokens_out = usage.get("output_tokens", 0) or 0
-            yield {"type": "usage", "input": tokens_in, "output": tokens_out}
+            context = _last_context_usage(live_session_id)
+            if context:
+                tokens_in, window = context
+            else:
+                window = None
+            yield {"type": "usage", "input": tokens_in, "output": tokens_out,
+                   "context_window": window}
         elif etype in {"error", "turn.failed"}:
             error_message = (event.get("message") or
                              (event.get("error") or {}).get("message") or str(event))
