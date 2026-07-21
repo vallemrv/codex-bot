@@ -1,0 +1,43 @@
+# ===== Secretos / credenciales =====
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token
+secrets/
+credentials*
+
+# ===== Datos locales del bot =====
+bot.db
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ===== Python =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Logs / temporales =====
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+
+# ===== Sistema / editores =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

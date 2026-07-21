@@ -1,0 +1,15 @@
+[Unit]
+Description=codex-bot - codex-cli por Telegram
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/valle/proyectos/codex-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/valle/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/valle/proyectos/codex-bot/.venv/bin/python /home/valle/proyectos/codex-bot/src/telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
