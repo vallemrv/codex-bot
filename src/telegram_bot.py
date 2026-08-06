@@ -453,6 +453,23 @@ def _tool_arg(name: str, inp: dict, directory: str) -> str:
     return val.replace("`", "'")
 
 
+def _md_code(text: str) -> str:
+    """Make arbitrary text safe inside a legacy-Markdown code span, where the
+    closing backtick is the only character with any meaning."""
+    return text.replace("`", "'")
+
+
+def _md_snip(text: str, limit: int = 200) -> str:
+    """Tail of free-form model text, safe to embed in a code span.
+
+    Legacy Markdown only honours backslash escapes *outside* an entity, so the
+    old ``_…\\_…_`` italics blew up on any underscore — and a snake_case name
+    such as ``telegram_bot.py`` in a preamble made Telegram reject *every*
+    subsequent edit, freezing the status on ESPERANDO. Code spans parse nothing.
+    """
+    return " ".join(_md_code(text[-limit:]).split())
+
+
 def _build_status_text(st: dict) -> str:
     icons = {"busy": "🔴", "thinking": "🤔", "idle": "🟢", "error": "❌", "pending": "⚪"}
     state = st.get("state", "busy")
@@ -464,8 +481,8 @@ def _build_status_text(st: dict) -> str:
     effort = st.get("effort")
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
 
-    sess_label = (st.get("session_label") or "").replace("`", "'").replace("*", "·").replace("_", "\\_")
-    label_line = f"💬 _{sess_label[:50]}_" if sess_label else ""
+    sess_label = _md_code(st.get("session_label") or "")[:50]
+    label_line = f"💬 `{sess_label}`" if sess_label else ""
     effort_str = f" · ⚡`{effort or 'high'}`"
     lines = [
         f"{icon} *{labels.get(state, state.upper())}* | 📂 `{cwd_name}`",
@@ -490,11 +507,9 @@ def _build_status_text(st: dict) -> str:
         if tools:
             lines.append("⚡ " + " · ".join(f"`{t}`" for t in tools[-5:]))
     if st.get("reasoning_text"):
-        snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "").replace("_", "\\_")
-        lines.append(f"💭 _{snip}_")
+        lines.append(f"💭 `{_md_snip(st['reasoning_text'])}`")
     if st.get("stream_text"):
-        snip = st["stream_text"][-200:].replace("`", "'").replace("*", "").replace("_", "\\_")
-        lines.append(f"✍️ _{snip}_")
+        lines.append(f"✍️ `{_md_snip(st['stream_text'])}`")
     tok_in = st.get("tokens_input", 0)
     if tok_in:
         ctx_str, _ = _ctx_pct(tok_in, st.get("model"), st.get("context_window"))
@@ -534,8 +549,22 @@ async def _flush_status(skey: str):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]),
         )
-    except BadRequest:
-        pass
+    except BadRequest as e:
+        # A Markdown edge case in model-authored text rejects *every* edit, which
+        # would freeze this status forever. Repaint it unformatted instead of
+        # dropping the update, and say so in the log rather than failing silently.
+        if "parse" not in str(e).lower() and "entit" not in str(e).lower():
+            return
+        logger.warning(f"status markdown rejected for {skey}: {e}")
+        try:
+            await APP.bot.edit_message_text(
+                chat_id=ADMIN_ID, message_id=st["msg_id"],
+                text=_build_status_text(st), parse_mode=None,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]),
+            )
+        except (BadRequest, RetryAfter, NetworkError):
+            pass
     except RetryAfter as e:
         # Honor the backoff Telegram actually asked for (+1s buffer). Retrying
         # *earlier* than retry_after — as a too-low cap would force — only earns a
@@ -1394,7 +1423,7 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if active_dir and active_sid:
         s = _find_session(active_sid, active_dir)
         label = _session_label(s).replace("`", "'").replace("_", "\\_")[:40] if s else active_sid[:8]
-        dir_name = Path(active_dir).name.replace("`", "'").replace("_", "\\_")
+        dir_name = _md_code(Path(active_dir).name)
         header = f"✅ Activa: `{dir_name}` › {label}\n\n"
 
     btns = _project_picker_rows(by_dir, "sesspick", mark_active=True)
@@ -3076,9 +3105,9 @@ def main():
                      "Estas tareas se interrumpieron (no se perdió tu historial, "
                      "pero conviene revisarlas):"]
             for o in orphans[:10]:
-                name = (Path(o.get("directory", "")).name or "?").replace("_", "\\_")
-                prm = (o.get("prompt") or "").replace("\n", " ").replace("_", "\\_")[:50]
-                lines.append(f"• 📂 `{name}` — _{prm}_" if prm else f"• 📂 `{name}`")
+                name = _md_code(Path(o.get("directory", "")).name or "?")
+                prm = " ".join(_md_code(o.get("prompt") or "").split())[:50]
+                lines.append(f"• 📂 `{name}` — `{prm}`" if prm else f"• 📂 `{name}`")
             try:
                 await application.bot.send_message(
                     ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
