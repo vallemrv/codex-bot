@@ -175,12 +175,34 @@ def _command(cwd: str, model: str | None, resume_session_id: str | None,
     return cmd
 
 
+def _reasoning_text(item: dict) -> str:
+    """Text of a reasoning item, tolerating the several shapes codex-cli uses.
+
+    Recent versions ship reasoning as encrypted content with an empty ``summary``
+    list, so this returns "" and no thinking event is emitted; the agent's
+    preamble messages carry the live narration instead.
+    """
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    summary = item.get("summary")
+    if isinstance(summary, str):
+        return summary
+    if isinstance(summary, list):
+        parts = [part.get("text", "") if isinstance(part, dict) else str(part)
+                 for part in summary]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
 def _item_events(item: dict):
     kind = item.get("type", "")
     if kind == "agent_message" and item.get("text"):
         yield {"type": "text", "text": item["text"]}
-    elif kind == "reasoning" and (item.get("text") or item.get("summary")):
-        yield {"type": "thinking", "text": item.get("text") or item.get("summary")}
+    elif kind == "reasoning":
+        text = _reasoning_text(item)
+        if text:
+            yield {"type": "thinking", "text": text}
     elif kind == "command_execution":
         yield {"type": "tool", "name": "Bash", "input": {"command": item.get("command", "")}}
     elif kind == "file_change":
@@ -231,6 +253,10 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
             if sid:
                 live_session_id = sid
                 yield {"type": "session", "session_id": sid}
+        elif etype == "turn.started":
+            # The first item can take several seconds; mark the turn live so the
+            # status leaves "ESPERANDO" as soon as codex accepts the prompt.
+            yield {"type": "turn_start"}
         elif etype in {"item.started", "item.completed", "item.updated"}:
             item = event.get("item") or {}
             for normalized in _item_events(item):

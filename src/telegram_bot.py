@@ -889,9 +889,19 @@ async def _run_task(skey: str, directory: str, prompt: str,
                 if active and active.get("directory") == directory \
                         and not active.get("claude_session_id"):
                     db.update_active_session_id(sid)
-            elif t == "text":
+            elif t == "turn_start":
                 if st:
                     st["state"] = "busy"
+                    _touch_status(st)
+            elif t == "text":
+                # Codex no longer exposes reasoning summaries, so the agent's
+                # preamble messages are the only live narration available: show
+                # them in the status instead of just flipping the state.
+                if st:
+                    st["state"] = "busy"
+                    st["stream_text"] = ev["text"]
+                    st["tool"] = ""
+                    st["tool_arg"] = ""
                     _touch_status(st)
             elif t == "thinking":
                 if st:
