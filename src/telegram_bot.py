@@ -1757,11 +1757,18 @@ async def _run_btw(update: Update, question: str, directory: str, sid: str, mode
         answer = f"❌ {exc}"
 
     # Drop the throwaway forked session so it never clutters the pickers.
+    # codex-cli's `exec resume --ephemeral` can silently fork a brand-new,
+    # unrelated thread instead of truly resuming `sid` (openai/codex#15538);
+    # when that happens the forked session's own cwd may not match
+    # `directory`, so search all projects by id (unique UUID) rather than
+    # filtering by directory, or the stray session leaks into /sessions.
     if forked_sid and forked_sid != sid:
         try:
-            cc.delete_session(forked_sid, directory=directory)
-        except Exception:  # noqa: BLE001
-            pass
+            cc.delete_session(forked_sid, directory=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"btw: no se pudo borrar la sesión bifurcada {forked_sid} "
+                f"(dir={directory}): {exc}")
         db.forget_session(forked_sid)
 
     out = "💬 *BTW* — no afecta al historial\n\n" + (answer or "(sin respuesta)")
