@@ -910,14 +910,32 @@ async def _run_task(skey: str, directory: str, prompt: str,
                     RUNNING[skey]["client"] = ev["client"]
             elif t == "session":
                 sid = ev["session_id"]
+                forked = bool(resume_sid) and sid != resume_sid
+                if forked:
+                    # codex-cli can silently fork onto a new session id
+                    # mid-conversation (openai/codex#15538, #29426 — often
+                    # triggered by auto-compaction near the context limit).
+                    # Keep the original title and follow the new id as active
+                    # so the next message doesn't keep resuming the now-dead
+                    # old id, which would just fork again and snowball
+                    # duplicate entries in the picker.
+                    old_meta = db.get_session_meta(resume_sid) or {}
+                    session_title = old_meta.get("title") or title
+                    logger.warning(
+                        f"codex bifurcó la sesión {resume_sid} -> {sid} "
+                        f"a mitad de conversación (dir={directory})")
+                else:
+                    session_title = title
                 KNOWN_SID[skey] = sid
-                db.remember_session(sid, directory, model, title)
+                db.remember_session(sid, directory, model, session_title)
                 if st and not st.get("session_label"):
-                    st["session_label"] = title
+                    st["session_label"] = session_title
                 active = db.get_active()
-                if active and active.get("directory") == directory \
-                        and not active.get("claude_session_id"):
-                    db.update_active_session_id(sid)
+                if active and active.get("directory") == directory:
+                    if not active.get("claude_session_id"):
+                        db.update_active_session_id(sid)
+                    elif forked and active.get("claude_session_id") == resume_sid:
+                        db.update_active_session_id(sid)
             elif t == "turn_start":
                 if st:
                     st["state"] = "busy"
