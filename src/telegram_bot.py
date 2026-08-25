@@ -212,11 +212,14 @@ def _canonical_skey(skey: str) -> str:
 
 def _session_label(s) -> str:
     sid = getattr(s, "session_id", "")
+    native_title = getattr(s, "custom_title", None)
+    if native_title:
+        return native_title
     if sid:
         meta = db.get_session_meta(sid)
         if meta and meta.get("title"):
             return meta["title"]
-    return (getattr(s, "custom_title", None) or getattr(s, "summary", None)
+    return (getattr(s, "summary", None)
             or getattr(s, "first_prompt", None) or sid[:8]
             or "sesión")
 
@@ -229,18 +232,18 @@ def _find_session(sid: str, cwd: str):
     return None
 
 
-def _context_bar(file_size: int, model: str | None = None) -> str:
-    """Rough context-usage indicator from conversation JSONL file size.
-    Window depends on the model (1M for opus-1m, else 200K)."""
-    window = cc.context_window(model)
-    est = file_size // 6
+def _context_bar(file_size: int, model: str | None = None,
+                 tokens: int | None = None, window: int | None = None) -> str:
+    """Context indicator from Codex token events, with a file-size fallback."""
+    window = window or cc.context_window(model)
+    est = tokens if tokens is not None else file_size // 6
     pct = min(99, est * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
-    kb = file_size / 1024
-    size_str = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
+    size_str = f"{est:,} / {window:,} tok" if tokens is not None else f"~{est:,} tok"
     tip = " — considera sesión nueva" if pct >= 80 else ""
     win_tag = " /1M" if window >= 1_000_000 else ""
-    return f"{icon} ctx ~{pct}%{win_tag} ({size_str}){tip}"
+    approx = "" if tokens is not None else "~"
+    return f"{icon} ctx {approx}{pct}%{win_tag} ({size_str}){tip}"
 
 
 def _ctx_pct(tokens_input: int, model: str | None = None,
@@ -306,7 +309,9 @@ def _session_card(s, meta: dict | None, cwd: str) -> str:
         f"💬 {title}",
     ]
     if file_size:
-        lines.append(_context_bar(file_size, model))
+        lines.append(_context_bar(
+            file_size, model, getattr(s, "context_tokens", None),
+            getattr(s, "context_window", None)))
     return "\n".join(lines)
 
 
@@ -1255,11 +1260,16 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
         # :s suffix tells cb_delsess to re-render in sessions mode after delete
         dele = (lambda sid: f"delsess:{_key(sid)}:{pk}:s") if mode == "sessions" else (lambda sid: f"delsess:{_key(sid)}:{pk}")
     btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=new_cb)]]
+    labels = [_session_label(s) for s in sessions]
+    duplicate_labels = {label for label in labels if labels.count(label) > 1}
     for s in sessions[:10]:
         sid = s.session_id
         is_active = sid == cur_sid
         prefix = "✅ " if is_active else ""
-        label = f"{prefix}{_session_label(s)[:26 if is_active else 28]}"
+        session_label = _session_label(s)
+        suffix = f" · {sid[:6]}" if session_label in duplicate_labels else ""
+        max_len = (26 if is_active else 28) - len(suffix)
+        label = f"{prefix}{session_label[:max_len]}{suffix}"
         btns.append([
             InlineKeyboardButton(label, callback_data=sel(sid)),
             InlineKeyboardButton("🗑", callback_data=dele(sid)),
@@ -1548,6 +1558,7 @@ async def cb_closeallok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     interrupted = await _cancel_running(set(RUNNING) | set(STATUSES) | set(QUEUES))
     deleted = 0
+    failures = []
     for s in _list_sessions():
         cwd = getattr(s, "cwd", "") or ""
         if not cwd:
@@ -1557,14 +1568,21 @@ async def cb_closeallok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             db.forget_session(s.session_id)
             KNOWN_SID.pop(s.session_id, None)
             deleted += 1
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failures.append((s.session_id, str(exc)))
     had_active = bool(db.get_active())
-    db.clear_active()
+    if not failures:
+        db.clear_active()
+        db.forget_all_sessions()
+        db.inflight_clear()
+        KNOWN_SID.clear()
     msg = f"✅ Todas las sesiones cerradas — {deleted} borrada(s)."
+    if failures:
+        msg = (f"⚠️ Borrado parcial — {deleted} borrada(s), "
+               f"{len(failures)} no se pudieron borrar. Se conservan sus registros.")
     if interrupted:
         msg += f"\n🛑 {interrupted} tarea(s) en curso interrumpida(s)."
-    if had_active:
+    if had_active and not failures:
         msg += "\n⚠️ _Ya no hay sesión activa._ Usa /open."
     await q.edit_message_text(msg, parse_mode="Markdown")
 
@@ -1588,22 +1606,29 @@ async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         k for k in (set(RUNNING) | set(STATUSES) | set(QUEUES))
         if _dir_of_skey(k) == cwd)
     deleted = 0
+    failures = []
     for s in sessions:
         try:
             cc.delete_session(s.session_id, directory=cwd)
             db.forget_session(s.session_id)
             KNOWN_SID.pop(s.session_id, None)
             deleted += 1
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failures.append((s.session_id, str(exc)))
     active = db.get_active()
     cleared_active = bool(active and active.get("directory") == cwd)
-    if cleared_active:
+    if cleared_active and not failures:
         db.clear_active()
+    if not failures:
+        db.forget_directory_sessions(cwd)
+        KNOWN_SID.pop(_skey(cwd, None), None)
     msg = f"✅ `{Path(cwd).name}` cerrado — {deleted} sesión(es) borradas."
+    if failures:
+        msg = (f"⚠️ `{Path(cwd).name}`: borrado parcial — {deleted} borrada(s), "
+               f"{len(failures)} no se pudieron borrar. Se conservan sus registros.")
     if interrupted:
         msg += f"\n🛑 {interrupted} tarea(s) en curso interrumpida(s)."
-    if cleared_active:
+    if cleared_active and not failures:
         msg += "\n⚠️ _Era tu proyecto activo: ya no hay sesión activa._ Usa /open."
     await q.edit_message_text(msg, parse_mode="Markdown")
 
@@ -1716,6 +1741,11 @@ async def cb_seteffort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _apply_rename(update: Update, sid: str, cwd: str, model: str | None, title: str):
     title = title[:60]
+    try:
+        await asyncio.to_thread(cc.set_session_name, sid, title)
+    except Exception as exc:  # keep our metadata aligned: either both change or neither
+        await update.message.reply_text(f"❌ Codex no pudo renombrar la sesión: {exc}")
+        return
     db.set_session_title(sid, title)
     await update.message.reply_text(
         f"✅ *Sesión renombrada:* `{title}`\n📂 `{Path(cwd).name}` · 🧩 `{model or cc.DEFAULT_MODEL}`",
@@ -2591,6 +2621,7 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _expired(q)
         return
     sid, cwd = vals
+    await _cancel_running([_skey(cwd, sid)])
     try:
         cc.delete_session(sid, directory=cwd or None)
     except Exception as exc:  # noqa: BLE001
@@ -2598,6 +2629,9 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     db.forget_session(sid)
     KNOWN_SID.pop(sid, None)  # purge mapping for this materialized session
+    active = db.get_active()
+    if active and active.get("claude_session_id") == sid:
+        db.clear_active()
     if (SEND_MODE.get("target") or {}).get("skey") == sid:
         SEND_MODE["target"] = None
     await _show_session_picker(q, cwd, _list_sessions(directory=cwd), mode="send")

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -312,6 +313,8 @@ class Session:
     git_branch: str | None = None
     custom_title: str | None = None
     path: Path | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
 
 
 def _session_home() -> Path:
@@ -346,7 +349,90 @@ def _read_session(path: Path) -> Session | None:
         return None
 
 
+def _app_server_request(method: str, params: dict) -> dict:
+    """Make one authoritative request to Codex's thread store."""
+    proc = subprocess.Popen(
+        [_codex_bin(), "app-server", "--stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+
+    def request(request_id: int, request_method: str, request_params: dict) -> dict:
+        proc.stdin.write(json.dumps({
+            "method": request_method, "id": request_id, "params": request_params,
+        }) + "\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("codex app-server terminó sin responder")
+            response = json.loads(line)
+            if response.get("id") != request_id:
+                continue
+            if response.get("error"):
+                raise RuntimeError(str(response["error"]))
+            return response.get("result") or {}
+
+    try:
+        request(1, "initialize", {"clientInfo": {
+            "name": "codex_telegram_bot", "title": "Codex Telegram Bot",
+            "version": "1.0",
+        }})
+        proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
+        return request(2, method, params)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _list_sessions_native(directory: str | None = None) -> list[Session]:
+    sessions: list[Session] = []
+    cursor = None
+    while True:
+        params: dict = {
+            "limit": 100,
+            "archived": False,
+            # The bot creates threads through `codex exec`; app-server's default
+            # interactive-source filter intentionally excludes them.
+            "sourceKinds": ["exec"],
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+        }
+        if directory is not None:
+            params["cwd"] = directory
+        if cursor:
+            params["cursor"] = cursor
+        result = _app_server_request("thread/list", params)
+        for thread in result.get("data") or []:
+            path = Path(thread["path"]) if thread.get("path") else None
+            size = path.stat().st_size if path and path.exists() else 0
+            usage = _last_context_usage(thread.get("id"))
+            sessions.append(Session(
+                session_id=thread["id"], cwd=thread.get("cwd") or "",
+                summary=(thread.get("preview") or "").strip().replace("\n", " ")[:80],
+                first_prompt=thread.get("preview") or "",
+                last_modified=int(thread.get("updatedAt", 0) * 1000),
+                file_size=size,
+                git_branch=(thread.get("gitInfo") or {}).get("branch"),
+                custom_title=thread.get("name"), path=path,
+                context_tokens=usage[0] if usage else None,
+                context_window=usage[1] if usage else None,
+            ))
+        cursor = result.get("nextCursor")
+        if not cursor:
+            return sessions
+
+
 def list_sessions(directory: str | None = None) -> list[Session]:
+    try:
+        return _list_sessions_native(directory)
+    except Exception as exc:  # keep the bot usable with older Codex versions
+        logger.warning("thread/list falló; usando lectura JSONL: %s", exc)
     root = _session_home()
     if not root.exists():
         return []
@@ -359,11 +445,13 @@ def list_sessions(directory: str | None = None) -> list[Session]:
 
 
 def delete_session(session_id: str, directory: str | None = None) -> None:
-    for session in list_sessions(directory):
-        if session.session_id == session_id and session.path:
-            session.path.unlink(missing_ok=True)
-            return
-    raise FileNotFoundError(f"No se encontró la sesión Codex {session_id}")
+    # This removes the active/archived rollout, Codex state-DB metadata and
+    # spawned descendants. Unlinking only the JSONL leaves ghost records.
+    _app_server_request("thread/delete", {"threadId": session_id})
+
+
+def set_session_name(session_id: str, name: str) -> None:
+    _app_server_request("thread/name/set", {"threadId": session_id, "name": name})
 
 
 refresh_catalog()

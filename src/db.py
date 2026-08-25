@@ -204,6 +204,17 @@ def forget_session(claude_session_id: str) -> None:
         )
 
 
+def forget_directory_sessions(directory: str) -> None:
+    """Remove all bot-owned metadata for a project whose threads were deleted."""
+    with _conn() as con:
+        con.execute("DELETE FROM session_meta WHERE directory = ?", (directory,))
+
+
+def forget_all_sessions() -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM session_meta")
+
+
 # --------------------------------------------------------------------------- #
 # Persisted callback keystore (compresses long callback_data values to ints)
 # --------------------------------------------------------------------------- #
