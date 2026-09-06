@@ -77,15 +77,6 @@ def init() -> None:
                 started_at REAL
             )
         """)
-        # Generic catalog cache (models_catalog persists the live /v1/models
-        # response here, so picker buttons survive a restart and offline starts).
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS catalog_cache (
-                key        TEXT PRIMARY KEY,
-                value      TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            )
-        """)
 
 
 # --------------------------------------------------------------------------- #
@@ -267,24 +258,3 @@ def inflight_all() -> list[dict]:
 def inflight_clear() -> None:
     with _conn() as con:
         con.execute("DELETE FROM inflight")
-
-
-# --------------------------------------------------------------------------- #
-# Generic catalog cache (currently: live models list from /v1/models)
-# --------------------------------------------------------------------------- #
-def catalog_get(key: str) -> dict | None:
-    with _conn() as con:
-        row = con.execute(
-            "SELECT value, updated_at FROM catalog_cache WHERE key = ?", (key,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def catalog_set(key: str, value: str) -> None:
-    with _conn() as con:
-        con.execute("""
-            INSERT INTO catalog_cache (key, value, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-        """, (key, value, time.time()))

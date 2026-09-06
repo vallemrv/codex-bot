@@ -3106,8 +3106,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def post_init(application: Application):
-        # Refresh the model catalog from Anthropic's /v1/models. Non-blocking
-        # for the bot: on failure we keep the cached/fallback catalog.
+        # Load the catalog codex-cli already cached on disk. No live fetch at
+        # startup: /refreshmodels is the explicit way to revalidate it.
         try:
             cc.refresh_catalog()
             logger.info("models catalog: %s", ", ".join(cc.MODELS))

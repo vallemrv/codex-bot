@@ -30,6 +30,7 @@ EFFORT_LEVELS = {
 }
 MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CATALOG_TIMEOUT = 60  # seconds allowed to `codex debug models`
 
 
 def cli_model(model: str | None) -> str | None:
@@ -46,9 +47,36 @@ def effort_levels(model: str | None) -> list[str]:
     return EFFORT_LEVELS.get(selected, ["low", "medium", "high", "xhigh"])
 
 
+def _fetch_catalog() -> bool:
+    """Make codex-cli revalidate ``models_cache.json`` against the API.
+
+    Reading the cache file is not enough: it only changes when codex-cli
+    decides to refresh it.  ``codex debug models`` re-fetches the catalog
+    (that is what ``--bundled`` opts out of) and rewrites the cache.
+    """
+    try:
+        proc = subprocess.run([_codex_bin(), "debug", "models"],
+                              capture_output=True, timeout=CATALOG_TIMEOUT,
+                              check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("No se pudo refrescar el catálogo de Codex: %s", exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning("`codex debug models` falló (%s): %s", proc.returncode,
+                       proc.stderr.decode("utf-8", "replace").strip()[:200])
+        return False
+    return True
+
+
 def refresh_catalog(force: bool = False) -> bool:
-    """Load the three highest-priority visible GPT models cached by codex-cli."""
+    """Load the visible GPT models cached by codex-cli.
+
+    With ``force`` the catalog is re-fetched first; the return value then
+    reports whether that live fetch worked, so callers can say when they are
+    falling back to a stale cache.
+    """
     global DEFAULT_MODEL
+    live = _fetch_catalog() if force else False
     try:
         data = json.loads(MODELS_CACHE.read_text(encoding="utf-8"))
         available = [
@@ -58,27 +86,26 @@ def refresh_catalog(force: bool = False) -> bool:
             and str(model.get("slug", "")).startswith("gpt-")
         ]
         available.sort(key=lambda model: model.get("priority", 10_000))
-        latest = available[:3]
-        if not latest:
+        if not available:
             return False
-        MODELS[:] = [model["slug"] for model in latest]
+        MODELS[:] = [model["slug"] for model in available]
         MODEL_LABELS.clear()
         MODEL_LABELS.update({
             model["slug"]: model.get("display_name", model["slug"])
-            for model in latest
+            for model in available
         })
         CONTEXT_WINDOWS.clear()
         CONTEXT_WINDOWS.update({
             model["slug"]: int(model.get("context_window") or DEFAULT_CONTEXT_WINDOW)
-            for model in latest
+            for model in available
         })
         EFFORT_LEVELS.clear()
         EFFORT_LEVELS.update({
             model["slug"]: [level["effort"] for level in model.get("supported_reasoning_levels", [])]
-            for model in latest
+            for model in available
         })
         DEFAULT_MODEL = MODELS[0]
-        return True
+        return live or not force
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         logger.warning("No se pudo cargar el catálogo de modelos de Codex: %s", exc)
         return False
