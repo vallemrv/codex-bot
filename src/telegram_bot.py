@@ -232,6 +232,13 @@ def _find_session(sid: str, cwd: str):
     return None
 
 
+def _window_tag(window: int) -> str:
+    """Short label for the window in use, e.g. ' /828K' or ' /1M'."""
+    if window >= 1_000_000:
+        return f" /{window / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+    return f" /{window // 1000}K"
+
+
 def _context_bar(file_size: int, model: str | None = None,
                  tokens: int | None = None, window: int | None = None) -> str:
     """Context indicator from Codex token events, with a file-size fallback."""
@@ -239,22 +246,23 @@ def _context_bar(file_size: int, model: str | None = None,
     est = tokens if tokens is not None else file_size // 6
     pct = min(99, est * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
-    size_str = f"{est:,} / {window:,} tok" if tokens is not None else f"~{est:,} tok"
     tip = " — considera sesión nueva" if pct >= 80 else ""
-    win_tag = " /1M" if window >= 1_000_000 else ""
-    approx = "" if tokens is not None else "~"
-    return f"{icon} ctx {approx}{pct}%{win_tag} ({size_str}){tip}"
+    if tokens is not None:
+        # The absolute figures already name the window; no need to repeat it.
+        return f"{icon} ctx {pct}% ({est:,} / {window:,} tok){tip}"
+    return f"{icon} ctx ~{pct}%{_window_tag(window)} (~{est:,} tok){tip}"
 
 
 def _ctx_pct(tokens_input: int, model: str | None = None,
              window: int | None = None) -> tuple[str, int]:
     """Returns (inline indicator, pct) from real input token count.
-    Window depends on the model (1M for opus-1m, else 200K)."""
+
+    The window comes from the live token event when Codex reports one, and
+    falls back to the model's effective window from the catalog."""
     window = window or cc.context_window(model)
     pct = min(99, tokens_input * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
-    win_tag = " /1M" if window >= 1_000_000 else ""
-    return f"{icon} ctx {pct}%{win_tag}", pct
+    return f"{icon} ctx {pct}%{_window_tag(window)}", pct
 
 
 def _model_label(model: str) -> str:

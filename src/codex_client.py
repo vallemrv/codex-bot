@@ -21,7 +21,14 @@ MODEL_LABELS = {
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-luna": "GPT-5.6 Luna",
 }
-DEFAULT_CONTEXT_WINDOW = 272_000
+# The catalog's ``context_window`` is the long-context billing threshold, not
+# the ceiling: ``max_context_window`` is.  Codex only serves the bigger window
+# when asked for it (see ``_command``), and it keeps
+# ``effective_context_window_percent`` of it for the conversation itself.
+DEFAULT_MAX_CONTEXT_WINDOW = 872_000
+DEFAULT_EFFECTIVE_PERCENT = 95
+DEFAULT_CONTEXT_WINDOW = DEFAULT_MAX_CONTEXT_WINDOW * DEFAULT_EFFECTIVE_PERCENT // 100
+MAX_CONTEXT_WINDOWS = {model: DEFAULT_MAX_CONTEXT_WINDOW for model in MODELS}
 CONTEXT_WINDOWS = {model: DEFAULT_CONTEXT_WINDOW for model in MODELS}
 EFFORT_LEVELS = {
     "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -39,7 +46,14 @@ def cli_model(model: str | None) -> str | None:
 
 
 def context_window(model: str | None) -> int:
+    """Tokens the conversation can actually use, for the status indicators."""
     return CONTEXT_WINDOWS.get(model or DEFAULT_MODEL, DEFAULT_CONTEXT_WINDOW)
+
+
+def max_context_window(model: str | None) -> int:
+    """Window to request from codex, before its effective-percent haircut."""
+    selected = DEFAULT_MODEL if not model or model == "default" else model
+    return MAX_CONTEXT_WINDOWS.get(selected, DEFAULT_MAX_CONTEXT_WINDOW)
 
 
 def effort_levels(model: str | None) -> list[str]:
@@ -94,11 +108,16 @@ def refresh_catalog(force: bool = False) -> bool:
             model["slug"]: model.get("display_name", model["slug"])
             for model in available
         })
+        MAX_CONTEXT_WINDOWS.clear()
         CONTEXT_WINDOWS.clear()
-        CONTEXT_WINDOWS.update({
-            model["slug"]: int(model.get("context_window") or DEFAULT_CONTEXT_WINDOW)
-            for model in available
-        })
+        for model in available:
+            ceiling = int(model.get("max_context_window")
+                          or model.get("context_window")
+                          or DEFAULT_MAX_CONTEXT_WINDOW)
+            percent = int(model.get("effective_context_window_percent")
+                          or DEFAULT_EFFECTIVE_PERCENT)
+            MAX_CONTEXT_WINDOWS[model["slug"]] = ceiling
+            CONTEXT_WINDOWS[model["slug"]] = ceiling * percent // 100
         EFFORT_LEVELS.clear()
         EFFORT_LEVELS.update({
             model["slug"]: [level["effort"] for level in model.get("supported_reasoning_levels", [])]
@@ -186,6 +205,9 @@ def _command(cwd: str, model: str | None, resume_session_id: str | None,
     selected = cli_model(model)
     if selected:
         cmd += ["--model", selected]
+    # Without this codex defaults to the 272K billing threshold instead of the
+    # model's real ceiling; it clamps anything larger to ``max_context_window``.
+    cmd += ["--config", f"model_context_window={max_context_window(model)}"]
     if effort:
         cmd += ["--config", f'model_reasoning_effort="{effort}"']
     if ephemeral:
