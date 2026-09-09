@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,11 @@ EFFORT_LEVELS = {
 MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CATALOG_TIMEOUT = 60  # seconds allowed to `codex debug models`
+CONTEXT_POLL_SECONDS = 5  # how often to resample the journal mid-turn
+# Journal bookkeeping per session, so mid-turn polling stays incremental.
+_JOURNAL_PATHS: dict[str, Path] = {}
+_JOURNAL_OFFSETS: dict[str, int] = {}
+_JOURNAL_USAGE: dict[str, tuple[int, int]] = {}
 
 
 def cli_model(model: str | None) -> str | None:
@@ -139,37 +145,77 @@ def build_mcp_server():
     return None
 
 
-def _last_context_usage(session_id: str | None) -> tuple[int, int] | None:
-    """Read the actual context used by the latest turn from Codex's journal.
+def _journal_path(session_id: str) -> Path | None:
+    """Locate a thread's own journal, remembering it: the scan reads every file.
 
-    The ``usage`` field in a resumed ``turn.completed`` can be cumulative.  The
-    journal's ``last_token_usage`` is the context of that individual turn.
+    Every subagent codex spawns writes its own journal carrying the *parent's*
+    ``session_id``, so a substring match picks whichever the filesystem lists
+    first — usually a short-lived subagent.  ``payload.id`` is the thread's own
+    id, which singles out the main thread (``thread_source: "user"``).
     """
-    if not session_id:
-        return None
+    cached = _JOURNAL_PATHS.get(session_id)
+    if cached is not None:
+        return cached
     try:
         for path in SESSIONS_DIR.rglob("*.jsonl"):
             with path.open(encoding="utf-8") as journal:
-                if session_id not in journal.readline():
+                try:
+                    meta = (json.loads(journal.readline()).get("payload") or {})
+                except (ValueError, AttributeError, json.JSONDecodeError):
                     continue
-                latest: tuple[int, int] | None = None
-                for line in journal:
-                    try:
-                        event = json.loads(line)
-                        payload = event.get("payload") or {}
-                        if event.get("type") != "event_msg" or payload.get("type") != "token_count":
-                            continue
-                        info = payload.get("info") or {}
-                        tokens = int((info.get("last_token_usage") or {}).get("input_tokens") or 0)
-                        window = int(info.get("model_context_window") or 0)
-                        if tokens and window:
-                            latest = (tokens, window)
-                    except (ValueError, TypeError, json.JSONDecodeError):
+                if (meta.get("id") or meta.get("session_id")) == session_id:
+                    _JOURNAL_PATHS[session_id] = path
+                    return path
+    except OSError as exc:
+        logger.debug("No se pudo localizar el journal de %s: %s", session_id, exc)
+    return None
+
+
+def _last_context_usage(session_id: str | None) -> tuple[int, int] | None:
+    """Context used by the most recent model request, from Codex's journal.
+
+    ``codex exec --json`` only reports usage once the turn ends, but the journal
+    gets a ``token_count`` per request while the turn runs — that is what keeps
+    the live indicator moving during long turns.  The ``usage`` field of a
+    resumed ``turn.completed`` can be cumulative; ``last_token_usage`` is the
+    context of that individual request.
+
+    Reads only what was appended since the last call, so it is cheap to poll.
+    """
+    if not session_id:
+        return None
+    path = _journal_path(session_id)
+    if path is None:
+        return None
+    latest = _JOURNAL_USAGE.get(session_id)
+    try:
+        with path.open(encoding="utf-8") as journal:
+            journal.seek(_JOURNAL_OFFSETS.get(session_id, 0))
+            while True:
+                line = journal.readline()
+                # A trailing partial line means codex is mid-write; leave the
+                # offset before it so the next poll reads it whole.
+                if not line.endswith("\n"):
+                    break
+                _JOURNAL_OFFSETS[session_id] = journal.tell()
+                try:
+                    event = json.loads(line)
+                    payload = event.get("payload") or {}
+                    if event.get("type") != "event_msg" or payload.get("type") != "token_count":
                         continue
-                return latest
+                    info = payload.get("info") or {}
+                    tokens = int((info.get("last_token_usage") or {}).get("input_tokens") or 0)
+                    window = int(info.get("model_context_window") or 0)
+                    if tokens and window:
+                        latest = (tokens, window)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
     except OSError as exc:
         logger.debug("No se pudo leer el contexto de la sesión %s: %s", session_id, exc)
-    return None
+        return latest
+    if latest is not None:
+        _JOURNAL_USAGE[session_id] = latest
+    return latest
 
 
 def _codex_bin() -> str:
@@ -289,44 +335,69 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
     live_session_id = resume_session_id
     tokens_in = tokens_out = 0
     error_message = ""
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        etype = event.get("type", "")
-        if etype == "thread.started":
-            sid = event.get("thread_id")
-            if sid:
-                live_session_id = sid
-                yield {"type": "session", "session_id": sid}
-        elif etype == "turn.started":
-            # The first item can take several seconds; mark the turn live so the
-            # status leaves "ESPERANDO" as soon as codex accepts the prompt.
-            yield {"type": "turn_start"}
-        elif etype in {"item.started", "item.completed", "item.updated"}:
-            item = event.get("item") or {}
-            for normalized in _item_events(item):
-                if normalized["type"] == "text":
-                    final_text = normalized["text"]
-                yield normalized
-        elif etype == "turn.completed":
-            usage = event.get("usage") or {}
-            tokens_in = usage.get("input_tokens", 0) or 0
-            tokens_out = usage.get("output_tokens", 0) or 0
-            context = _last_context_usage(live_session_id)
-            if context:
-                tokens_in, window = context
-            else:
-                window = None
-            yield {"type": "usage", "input": tokens_in, "output": tokens_out,
-                   "context_window": window}
-        elif etype in {"error", "turn.failed"}:
-            error_message = (event.get("message") or
-                             (event.get("error") or {}).get("message") or str(event))
+    reader: asyncio.Task | None = None
+    last_poll = 0.0
+    try:
+        while True:
+            # Wait on stdout with a timeout rather than blocking on it: a turn
+            # can go quiet for minutes while a tool runs, and that is exactly
+            # when the context indicator would otherwise freeze.
+            if reader is None:
+                reader = asyncio.ensure_future(proc.stdout.readline())
+            done, _ = await asyncio.wait({reader}, timeout=CONTEXT_POLL_SECONDS)
+            now = time.monotonic()
+            if live_session_id and now - last_poll >= CONTEXT_POLL_SECONDS:
+                last_poll = now
+                sample = await asyncio.to_thread(_last_context_usage,
+                                                 live_session_id)
+                if sample:
+                    yield {"type": "context", "input": sample[0],
+                           "context_window": sample[1]}
+            if reader not in done:
+                continue
+            line = reader.result()
+            reader = None
+            if not line:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = event.get("type", "")
+            if etype == "thread.started":
+                sid = event.get("thread_id")
+                if sid:
+                    live_session_id = sid
+                    yield {"type": "session", "session_id": sid}
+            elif etype == "turn.started":
+                # The first item can take several seconds; mark the turn live so
+                # the status leaves "ESPERANDO" as soon as codex accepts it.
+                yield {"type": "turn_start"}
+            elif etype in {"item.started", "item.completed", "item.updated"}:
+                item = event.get("item") or {}
+                for normalized in _item_events(item):
+                    if normalized["type"] == "text":
+                        final_text = normalized["text"]
+                    yield normalized
+            elif etype == "turn.completed":
+                usage = event.get("usage") or {}
+                tokens_in = usage.get("input_tokens", 0) or 0
+                tokens_out = usage.get("output_tokens", 0) or 0
+                context = _last_context_usage(live_session_id)
+                if context:
+                    tokens_in, window = context
+                else:
+                    window = None
+                yield {"type": "usage", "input": tokens_in, "output": tokens_out,
+                       "context_window": window}
+            elif etype in {"error", "turn.failed"}:
+                error_message = (event.get("message") or
+                                 (event.get("error") or {}).get("message")
+                                 or str(event))
+    finally:
+        # Cancelling the consumer must not leave the pending read behind.
+        if reader is not None and not reader.done():
+            reader.cancel()
 
     stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
     returncode = await proc.wait()

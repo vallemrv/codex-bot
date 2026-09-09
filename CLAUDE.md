@@ -24,6 +24,12 @@ facturación de contexto largo, **no** el techo: ese es `max_context_window`
 (95%) para la conversación → 828.400 tok reales. Sin ese flag te quedas en
 258.400.
 
+`codex exec --json` solo informa de uso al cerrar el turno, así que el
+indicador en vivo sondea `token_count` del journal cada 5 s. Ojo: cada
+subagente que lanza codex (astra es `multi_agent_version: v2`) escribe su
+propio journal con el `session_id` **del padre**; el hilo principal se
+identifica por `payload.id == session_id` (`thread_source: "user"`).
+
 Codex persiste el historial real en `~/.codex/sessions`. Las columnas SQLite
 llamadas `claude_session_id` se conservan internamente para evitar una migración,
 pero contienen IDs de conversación de Codex.

@@ -1011,6 +1011,12 @@ async def _run_task(skey: str, directory: str, prompt: str,
                             if relpath not in st["files_edited"]:
                                 st["files_edited"][relpath] = icon
                     _touch_status(st)
+            elif t == "context":
+                # Mid-turn sample: context only, the token totals close the turn.
+                if st:
+                    st["tokens_input"] = ev["input"]
+                    st["context_window"] = ev.get("context_window")
+                    _touch_status(st)
             elif t == "usage":
                 if st:
                     st["tokens_input"] = ev["input"]
