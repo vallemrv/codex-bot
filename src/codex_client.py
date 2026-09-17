@@ -403,13 +403,18 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
     returncode = await proc.wait()
     if returncode and not error_message:
         error_message = stderr or f"codex-cli terminó con código {returncode}"
-    if error_message:
+    # A turn issues one request per tool cycle, and codex reports a dropped
+    # stream ("Reconnecting... 5/5") as an `error` event even when it recovers
+    # and finishes the turn. Exit code 0 plus a final message means it did, so
+    # that event is noise, not a failure — don't let it poison the outcome.
+    failed = bool(returncode) or (bool(error_message) and not (final_text or "").strip())
+    if failed:
         yield {"type": "error", "message": error_message}
     yield {
         "type": "result", "text": final_text, "cost": 0.0,
         "input": tokens_in, "output": tokens_out,
-        "session_id": resume_session_id or "", "is_error": bool(returncode or error_message),
-        "subtype": "error_during_execution" if (returncode or error_message) else "success",
+        "session_id": resume_session_id or "", "is_error": failed,
+        "subtype": "error_during_execution" if failed else "success",
     }
 
 
