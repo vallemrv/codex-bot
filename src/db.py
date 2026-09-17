@@ -1,13 +1,16 @@
 """
-SQLite persistence for claude-bot.
+SQLite persistence for codex-bot.
 
-Claude persists the real conversation state on disk (~/.claude/projects/...),
-so we only track:
+Codex persists the real conversation state on disk (~/.codex/sessions), so we
+only track:
   - the active session pointer (directory + claude_session_id + model)
   - per-session model preference, so reactivating a session restores its model
 
-Session discovery (listing sessions per project) uses the Agent SDK's native
-list_sessions(), so we don't duplicate that here.
+The claude_session_id columns keep their name to avoid a migration; they hold
+Codex conversation ids.
+
+Session discovery (listing sessions per project) reads those session files via
+codex_client.list_sessions(), so we don't duplicate that here.
 """
 
 import sqlite3
@@ -106,7 +109,7 @@ def set_active(directory: str, claude_session_id: str | None, model: str | None,
 
 
 def update_active_session_id(claude_session_id: str) -> None:
-    """Fill in the session id once Claude creates it on the first prompt."""
+    """Fill in the session id once codex creates it on the first prompt."""
     with _conn() as con:
         con.execute(
             "UPDATE active SET claude_session_id = ? WHERE id = 1",

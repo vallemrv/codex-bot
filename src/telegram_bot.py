@@ -2,11 +2,12 @@
 codex-bot — Telegram remote control for codex-cli.
 
 Architecture:
-- Claude Agent SDK replaces the OpenCode server + SSE.
-- Each prompt runs a ClaudeSDKClient in a background asyncio.Task; its streamed
-  events drive a live status message and, on completion, the final reply.
-- Conversation continuity via resume=<claude_session_id> (Claude persists state
-  on disk). Session discovery uses the SDK's native list_sessions().
+- Each prompt runs a `codex exec --json` subprocess in a background asyncio.Task;
+  its streamed events drive a live status message and, on completion, the final
+  reply.
+- Conversation continuity via `codex exec resume <session_id>` (Codex persists
+  state in ~/.codex/sessions). Session discovery reads those files through
+  codex_client.list_sessions().
 - Single-admin model: only TELEGRAM_ADMIN_ID may use the bot.
 """
 
@@ -71,7 +72,7 @@ _STATUS_WAKE = None        # asyncio.Event — pinged when a status needs a redr
 RUNNING: dict = {}         # skey -> {"client", "task", "directory"}
 QUEUES: dict = {}          # skey -> deque[{"text","directory","model"}]
 MSG2SESS: dict = {}        # bot message_id -> {"skey","directory"}
-KNOWN_SID: dict = {}       # skey -> real claude session id once known
+KNOWN_SID: dict = {}       # skey -> real codex session id once known
 KEYSTORE: dict = {}        # int -> str   (compress long strings for callback_data)
 KEYSTORE_REV: dict = {}    # str -> int   (inverse index for O(1) _key lookups)
 # Ephemeral counter for perm/question ids — NOT persisted; these ids are only
@@ -715,7 +716,7 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
     cost = (final or {}).get("cost", 0.0)
     files = st.get("files_edited", {})
 
-    # Outcome icon — never claim success when Claude errored or was cancelled.
+    # Outcome icon — never claim success when codex errored or was cancelled.
     is_error = bool((final or {}).get("is_error"))
     subtype = (final or {}).get("subtype") or ""
     if cancelled:
@@ -1972,7 +1973,7 @@ async def cb_perm_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /esc
 # --------------------------------------------------------------------------- #
 async def _interrupt_client(skey: str) -> None:
-    """Ask the running Claude client to interrupt (best-effort, never raises)."""
+    """Ask the running codex client to interrupt (best-effort, never raises)."""
     entry = RUNNING.get(skey)
     if not entry:
         return
@@ -2965,8 +2966,8 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     service = "codex-bot.service"
 
     # Detect how the bot is running and pick the matching restart strategy.
-    # Order: systemd user unit (preferred — Claude's login lives in this user's
-    # ~/.claude) → systemd system unit via passwordless sudo → self re-exec.
+    # Order: systemd user unit (preferred — codex's login lives in this user's
+    # ~/.codex) → systemd system unit via passwordless sudo → self re-exec.
     # We probe systemd with `cat`, which finishes *before* anything kills us (a
     # plain `restart` would get SIGTERM'd mid-run inside our own cgroup and
     # falsely report failure). `-n` on sudo so it never blocks waiting for a
@@ -3160,7 +3161,7 @@ def main():
             chat_id=ADMIN_ID, menu_button=MenuButtonCommands())
 
         # Orphan recovery: any in-flight task row means a prompt was running
-        # when the process died (crash, redeploy, /restart). The Claude
+        # when the process died (crash, redeploy, /restart). The codex
         # subprocess is gone and its status message is frozen — clean it up and
         # tell the user, so nothing looks "stuck working" forever.
         try:
