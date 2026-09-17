@@ -741,14 +741,16 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
         ctx_pct = 0
     if cancelled:
         header += "\n🛑 _Cancelado por ti_"
+    elif error_msg:
+        # codex's own text (e.g. the stream-disconnect reason) says far more than
+        # the subtype, which is always error_during_execution when it is set.
+        header += f"\n❌ _{error_msg[:200]}_"
     elif is_error:
         # Surface the CLI's structured error reason (e.g. error_max_turns).
         reason = {"error_max_turns": "límite de turnos alcanzado",
                   "error_during_execution": "error durante la ejecución"}.get(
                       subtype, subtype or "error")
-        header += f"\n❌ _Claude terminó con error: {reason}_"
-    elif error_msg:
-        header += f"\n❌ _{error_msg[:200]}_"
+        header += f"\n❌ _codex terminó con error: {reason}_"
     if session_title:
         truncated_title = session_title[:25] + ("..." if len(session_title) > 25 else "")
         header += f"\n📌 `{truncated_title}`"
@@ -2815,7 +2817,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = PENDING_Q.get(qid_k)
         if data and not data["future"].done():
             data["future"].set_result(text)
-            await update.message.reply_text("✅ Respuesta enviada a Claude.")
+            await update.message.reply_text("✅ Respuesta enviada a codex.")
             await _relocate_status(data.get("skey"))
             return
         # The question already resolved/expired (answered via button, timed out,
